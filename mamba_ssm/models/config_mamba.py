@@ -1,8 +1,10 @@
 from dataclasses import dataclass, field
+from transformers.configuration_utils import PretrainedConfig
 
 
 @dataclass
-class MambaConfig:
+#class MambaConfig:
+class MambaConfig(PretrainedConfig):
 
     d_model: int = 2560
     d_intermediate: int = 0
@@ -16,3 +18,5 @@ class MambaConfig:
     fused_add_norm: bool = True
     pad_vocab_size_multiple: int = 8
     tie_embeddings: bool = True
+    ddense: bool = False
+    dense_type: str = ''

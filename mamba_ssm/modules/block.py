@@ -9,7 +9,7 @@ from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn
 
 class Block(nn.Module):
     def __init__(
-        self, dim, mixer_cls, mlp_cls, norm_cls=nn.LayerNorm, fused_add_norm=False, residual_in_fp32=False
+        self, dim, mixer_cls, mlp_cls, norm_cls=nn.LayerNorm, fused_add_norm=False, residual_in_fp32=False, dense_type='', ddense=False,
     ):
         """
         Simple block wrapping a mixer class with LayerNorm/RMSNorm and residual connection"
@@ -26,7 +26,13 @@ class Block(nn.Module):
         super().__init__()
         self.residual_in_fp32 = residual_in_fp32
         self.fused_add_norm = fused_add_norm
-        self.norm = norm_cls(dim)
+        self.dense_type = dense_type
+        self.num_ways = len(dense_type)
+        self.ddense = ddense
+        if self.num_ways >=2:
+            self.norms = torch.nn.ModuleList([norm_cls(dim) for _ in range(self.num_ways)])
+        else:
+            self.norm = norm_cls(dim)
         self.mixer = mixer_cls(dim)
         if mlp_cls is not nn.Identity:
             self.norm2 = norm_cls(dim)
@@ -39,6 +45,7 @@ class Block(nn.Module):
                 self.norm, (nn.LayerNorm, RMSNorm)
             ), "Only LayerNorm and RMSNorm are supported for fused_add_norm"
 
+    # @torch._dynamo.disable(recursive=True)
     def forward(
             self, hidden_states: Tensor, residual: Optional[Tensor] = None, inference_params=None, **mixer_kwargs
     ):
@@ -48,9 +55,21 @@ class Block(nn.Module):
             hidden_states: the sequence to the encoder layer (required).
             residual: hidden_states = Mixer(LN(residual))
         """
+        if self.ddense:
+            assert not self.fused_add_norm
+            hidden_states = (hidden_states + residual) if residual is not None else hidden_states
+            residual = None
+
+
         if not self.fused_add_norm:
-            residual = (hidden_states + residual) if residual is not None else hidden_states
-            hidden_states = self.norm(residual.to(dtype=self.norm.weight.dtype))
+            if self.ddense and self.num_ways > 1:
+                # print('pre shape', hidden_states.shape)
+                assert len(hidden_states.shape) == 4 
+                residual = hidden_states
+                hidden_states = torch.stack([ _norm(_residual.to(dtype=self.norms[0].weight.dtype)) for _norm, _residual in zip(self.norms, residual) ])
+            else:
+                residual = (hidden_states + residual) if residual is not None else hidden_states
+                hidden_states = self.norm(residual.to(dtype=self.norm.weight.dtype))
             if self.residual_in_fp32:
                 residual = residual.to(torch.float32)
         else:
@@ -85,6 +104,13 @@ class Block(nn.Module):
                 )
             hidden_states = self.mlp(hidden_states)
 
+        if self.ddense:
+            if self.num_ways == 1:
+                hidden_states = (hidden_states + residual) if residual is not None else hidden_states
+            else: # regard the first way as main residual
+                hidden_states = (hidden_states + residual[0]) if residual is not None else hidden_states
+                # print('post shape', hidden_states.shape)
+            residual = None
         return hidden_states, residual
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):

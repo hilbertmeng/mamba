@@ -46,9 +46,9 @@ def _chunk_cumsum_fwd_kernel(
     HAS_DT_BIAS: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr, BLOCK_SIZE_CHUNK: tl.constexpr,
 ):
-    pid_b = tl.program_id(axis=0)
-    pid_c = tl.program_id(axis=1)
-    pid_h = tl.program_id(axis=2)
+    pid_b = tl.program_id(axis=0) # batch
+    pid_c = tl.program_id(axis=1) # chunk
+    pid_h = tl.program_id(axis=2) # group of heads
     dt_ptr += pid_b * stride_dt_batch + pid_c * chunk_size * stride_dt_seqlen
     dt_out_ptr += pid_b * stride_dt_out_batch + pid_c * stride_dt_out_chunk
     dA_cumsum_ptr += pid_b * stride_dA_cs_batch + pid_c * stride_dA_cs_chunk
@@ -66,7 +66,8 @@ def _chunk_cumsum_fwd_kernel(
         dt_bias = tl.load(dt_bias_ptr + offs_h * stride_dt_bias_head, mask=offs_h < nheads, other=0.0).to(tl.float32)
         dt += dt_bias[:, None]
     if DT_SOFTPLUS:
-        dt = tl.where(dt <= 20.0, tl.math.log1p(tl.exp(dt)), dt)
+        # dt = tl.where(dt <= 20.0, tl.math.log1p(tl.exp(dt)), dt)
+        dt = tl.where(dt <= 20.0, tl.math.log(tl.exp(dt) + 1), dt)
     # As of Triton 2.2.0, tl.clamp is not available yet
     # dt = tl.clamp(dt, dt_min, dt_max)
     dt = tl.minimum(tl.maximum(dt, dt_min), dt_max)
@@ -139,7 +140,9 @@ def _chunk_cumsum_bwd_kernel(
         dt += dt_bias[:, None]
     if DT_SOFTPLUS:
         dt_presoftplus = dt
-        dt = tl.where(dt <= 20.0, tl.math.log1p(tl.exp(dt)), ddt)
+        # dt = tl.where(dt <= 20.0, tl.math.log1p(tl.exp(dt)), ddt)
+        dt = tl.where(dt <= 20.0, tl.math.log(tl.exp(dt) + 1), ddt)
+
     clamp_mask = (dt < dt_min) | (dt > dt_max)
     # As of Triton 2.2.0, tl.clamp is not available yet
     # dt = tl.clamp(dt, dt_min, dt_max)
@@ -570,12 +573,12 @@ def _chunk_state_bwd_ddAcs_stable_kernel(
 
 
 def _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=None, dt_softplus=False, dt_limit=(0.0, float("inf"))):
-    batch, seqlen, nheads = dt.shape
-    assert A.shape == (nheads,)
+    batch, seqlen, nheads = dt.shape # blh
+    assert A.shape == (nheads,) # h
     if dt_bias is not None:
         assert dt_bias.shape == (nheads,)
     nchunks = math.ceil(seqlen / chunk_size)
-    dt_out = torch.empty(batch, nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32)
+    dt_out = torch.empty(batch, nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32) # bhcl
     dA_cumsum = torch.empty(batch, nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32)
     grid_chunk_cs = lambda META: (batch, nchunks, triton.cdiv(nheads, META['BLOCK_SIZE_H']))
     with torch.cuda.device(dt.device.index):
@@ -855,12 +858,13 @@ def chunk_state_ref(B, x, dt, dA_cumsum):
     ngroups = B.shape[2]
     assert nheads % ngroups == 0
     assert B.shape == (batch, seqlen, ngroups, dstate)
-    B = repeat(B, "b l g d -> b l (g h) d", h=nheads // ngroups)
+    B = repeat(B, "b l g d -> b l (g h) d", h=nheads // ngroups) # expand shared K: (B, L, H, head_dim)
     assert dA_cumsum.shape == (batch, nheads, nchunks, chunk_size)
     if seqlen < nchunks * chunk_size:
         x = F.pad(x, (0, 0, 0, 0, 0, nchunks * chunk_size - seqlen))
         B = F.pad(B, (0, 0, 0, 0, 0, nchunks * chunk_size - seqlen))
-    x = rearrange(x, "b (c l) h p -> b c l h p", l=chunk_size)
-    B = rearrange(B, "b (c l) ... -> b c l ...", l=chunk_size)
-    decay_states = torch.exp((dA_cumsum[:, :, :, -1:] - dA_cumsum))
+    x = rearrange(x, "b (c l) h p -> b c l h p", l=chunk_size) # V: B, nchunks, chunk_size, nheads, head_dim
+    B = rearrange(B, "b (c l) ... -> b c l ...", l=chunk_size) # K: B, nchunks, chunk_size, nheads, head_dim
+    decay_states = torch.exp((dA_cumsum[:, :, :, -1:] - dA_cumsum)) # L in the paper: exp(log(cumprod(A))) 
     return torch.einsum("bclhn,bhcl,bhcl,bclhp->bchpn", B.to(x.dtype), decay_states.to(x.dtype), dt.to(x.dtype), x)
+    # K, L, A, V 

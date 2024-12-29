@@ -5,8 +5,13 @@ from functools import partial
 import json
 import os
 import copy
+import time
 
 from collections import namedtuple
+from einops import rearrange
+from torch import Tensor
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple, Union
+
 
 import torch
 import torch.nn as nn
@@ -14,6 +19,7 @@ import torch.nn as nn
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.modules.mamba_simple import Mamba
 from mamba_ssm.modules.mamba2 import Mamba2
+#from mamba_ssm.modules.mamba2_simple import Mamba2Simple as Mamba2
 from mamba_ssm.modules.mha import MHA
 from mamba_ssm.modules.mlp import GatedMLP
 from mamba_ssm.modules.block import Block
@@ -39,6 +45,8 @@ def create_block(
     layer_idx=None,
     device=None,
     dtype=None,
+    dense_type='',
+    ddense=False,
 ):
     if ssm_cfg is None:
         ssm_cfg = {}
@@ -56,6 +64,8 @@ def create_block(
         mixer_cls = partial(
             Mamba2 if ssm_layer == "Mamba2" else Mamba,
             layer_idx=layer_idx,
+            ddense=ddense,
+            dense_type=dense_type,
             **ssm_cfg,
             **factory_kwargs
         )
@@ -75,6 +85,8 @@ def create_block(
         mixer_cls,
         mlp_cls,
         norm_cls=norm_cls,
+        dense_type=dense_type,
+        ddense=ddense,
         fused_add_norm=fused_add_norm,
         residual_in_fp32=residual_in_fp32,
     )
@@ -115,6 +127,51 @@ def _init_weights(
                     p /= math.sqrt(n_residuals_per_layer * n_layer)
 
 
+class DynamicDenseBlock(nn.Module):
+    def __init__(self, config, lidx: int) -> None:
+        super().__init__()
+        self.config = config
+        self.norm = RMSnormNoscale()
+        l = lidx + 2
+        C = len(self.config.dense_type) if lidx < config.n_layer -1 else 1
+        self.C = C
+        hid_dim = l * C 
+        out_dim = l * C
+        # round & expand
+        if lidx == config.n_layer - 1: hid_dim = hid_dim*4 
+        hid_dim = (hid_dim // 64 +1) * 64
+        self.w1 = nn.Linear(config.d_model, hid_dim, bias=False)
+        self.act = nn.GELU() 
+        # self.w2 = nn.Linear(hid_dim, out_dim, bias=False)
+        self.w2 = nn.Parameter(data=torch.zeros(hid_dim,out_dim))
+    
+    # @torch.compile(fullgraph=True)
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.norm(x) 
+        # dw = self.w2(self.act(self.w1(x))) # BTD->BTL
+        dw = self.act(self.w1(x)) @ self.w2 # BTD->BTL
+        dw = rearrange(dw, 'B T (C L) -> C B T L', C=self.C)
+        return dw
+    
+    @torch.compile(fullgraph=True)
+    def layer_mix(self, dw, hids, lidx)-> Tensor:
+        x = sum(dw[:,:,:,j,None] * hids[j][None] for j in range(lidx+2)) # CBTL, LBTD-> CBTD
+        return x
+
+class RMSnormNoscale(nn.Module):
+    
+    def __init__(self, epsilon=1e-6, dim=-1):
+        super().__init__()
+        self.dim = dim 
+        self.epsilon = epsilon
+
+    def forward(self, inputs):
+        var = inputs.pow(2).mean(dim=self.dim, keepdim=True)
+        normed_inputs = inputs * torch.rsqrt(var + self.epsilon)
+        return normed_inputs 
+
+
+
 class MixerModel(nn.Module):
     def __init__(
         self,
@@ -132,9 +189,11 @@ class MixerModel(nn.Module):
         residual_in_fp32=False,
         device=None,
         dtype=None,
+        model_config=None,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
+        self.config = model_config
         self.residual_in_fp32 = residual_in_fp32
 
         self.embedding = nn.Embedding(vocab_size, d_model, **factory_kwargs)
@@ -162,6 +221,8 @@ class MixerModel(nn.Module):
                     residual_in_fp32=residual_in_fp32,
                     fused_add_norm=fused_add_norm,
                     layer_idx=i,
+                    dense_type=self.config.dense_type,
+                    ddense=self.config.ddense,
                     **factory_kwargs,
                 )
                 for i in range(n_layer)
@@ -171,6 +232,16 @@ class MixerModel(nn.Module):
         self.norm_f = (nn.LayerNorm if not rms_norm else RMSNorm)(
             d_model, eps=norm_epsilon, **factory_kwargs
         )
+
+        self.ddense = self.config.ddense
+        self.dense_type = self.config.dense_type
+        assert self.dense_type in ['zxbct', 'zs', 'l']
+
+        self.num_ways = len(self.dense_type)
+        if self.ddense:
+            C = len(self.config.dense_type)
+            self.dense_bs = nn.ParameterList([nn.Parameter(data=torch.tensor([0.]*(lidx+1) + [1.]).repeat(C,1)) for lidx in range(self.config.n_layer)]) # C*L
+            self.dynamic_dense = nn.ModuleList([DynamicDenseBlock(self.config, lidx) for lidx in range(self.config.n_layer)])
 
         self.apply(
             partial(
@@ -187,13 +258,40 @@ class MixerModel(nn.Module):
             for i, layer in enumerate(self.layers)
         }
 
+    # @torch.compile(fullgraph=True)
     def forward(self, input_ids, inference_params=None, **mixer_kwargs):
         hidden_states = self.embedding(input_ids)
         residual = None
-        for layer in self.layers:
+        hids = [hidden_states] 
+        if self.num_ways >= 2:
+            hidden_states = torch.stack([hidden_states] * self.num_ways)
+
+        for lidx, layer in enumerate(self.layers):
+            # t0 = time.time()
+            # print('lidx', lidx)
             hidden_states, residual = layer(
                 hidden_states, residual, inference_params=inference_params
             )
+            # t1 = time.time()
+            if self.ddense:
+                assert residual is None
+                x = hidden_states 
+                hids.append(x)
+                dw = self.dynamic_dense[lidx](x) # BTD -> CBTL
+                dw = dw + self.dense_bs[lidx][:,None,None,:] # CBTL
+                C = len(self.config.dense_type) if lidx < self.config.n_layer -1 else 1
+                x = tuple([sum(dw[cidx,:,:,j,None] * hids[j] for j in range(lidx+2)) for cidx in range(C)]) # CBTL, LBTD-> CBTD
+                # x = sum(dw[:,:,:,j,None] * hids[j][None] for j in range(lidx+2)) # CBTL, LBTD-> CBTD
+                # x = self.dynamic_dense[lidx].layer_mix(dw, hids, lidx)
+                if self.config.dense_type == 'l':
+                    x = x[0]
+                else:
+                    x = torch.stack(x)
+                hidden_states = x 
+            # t2 = time.time()
+            # print(lidx, t1-t0, t2-t1)
+                    
+        hidden_states = hidden_states[0] if self.ddense and self.num_ways>=2 else hidden_states
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
@@ -250,6 +348,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
             initializer_cfg=initializer_cfg,
             fused_add_norm=fused_add_norm,
             residual_in_fp32=residual_in_fp32,
+            model_config=config,
             **factory_kwargs,
         )
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False, **factory_kwargs)
@@ -280,6 +379,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         if num_last_tokens > 0:
             hidden_states = hidden_states[:, -num_last_tokens:]
         lm_logits = self.lm_head(hidden_states)
+        # print('logits', lm_logits.shape, lm_logits[0,-1])
         CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
         return CausalLMOutput(logits=lm_logits)
 

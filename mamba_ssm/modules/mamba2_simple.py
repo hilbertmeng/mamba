@@ -66,7 +66,7 @@ class Mamba2Simple(nn.Module):
         self.use_mem_eff_path = use_mem_eff_path
         self.layer_idx = layer_idx
 
-        # Order: [z, x, B, C, dt]
+        # Order: [z: d_inner, x: d_inner, B: d_state, C: d_state, dt: nheads] 
         d_in_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
         self.in_proj = nn.Linear(self.d_model, d_in_proj, bias=bias, **factory_kwargs)
 
@@ -98,7 +98,7 @@ class Mamba2Simple(nn.Module):
         dt = torch.clamp(dt, min=dt_init_floor)
         # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
         inv_dt = dt + torch.log(-torch.expm1(-dt))
-        self.dt_bias = nn.Parameter(inv_dt)
+        self.dt_bias = nn.Parameter(inv_dt) # nheads
         # Just to be explicit. Without this we already don't put wd on dt_bias because of the check
         # name.endswith("bias") in param_grouping.py
         self.dt_bias._no_weight_decay = True
@@ -107,12 +107,12 @@ class Mamba2Simple(nn.Module):
         assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
         A = torch.empty(self.nheads, dtype=torch.float32, device=device).uniform_(*A_init_range)
         A_log = torch.log(A).to(dtype=dtype)
-        self.A_log = nn.Parameter(A_log)
+        self.A_log = nn.Parameter(A_log) # nheads
         # self.register_buffer("A_log", torch.zeros(self.nheads, dtype=torch.float32, device=device), persistent=True)
         self.A_log._no_weight_decay = True
 
         # D "skip" parameter
-        self.D = nn.Parameter(torch.ones(self.nheads, device=device))
+        self.D = nn.Parameter(torch.ones(self.nheads, device=device)) # nheads
         self.D._no_weight_decay = True
 
         # Extra normalization layer right before output projection
@@ -158,7 +158,7 @@ class Mamba2Simple(nn.Module):
         else:
             z, xBC, dt = torch.split(
                 zxbcdt, [self.d_inner, self.d_inner + 2 * self.ngroups * self.d_state, self.nheads], dim=-1
-            )
+            ) # z: gate, xBC: VKQ, dt: dynamic a 
             dt = F.softplus(dt + self.dt_bias)  # (B, L, nheads)
             assert self.activation in ["silu", "swish"]
 
@@ -173,27 +173,30 @@ class Mamba2Simple(nn.Module):
                     weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
                     bias=self.conv1d.bias,
                     activation=self.activation,
-                ).transpose(1, 2)
+                ).transpose(1, 2)  # casual depth-wise conv on VKQ, following SiLU activation  
 
             # Split into 3 main branches: X, B, C
             # These correspond to V, K, Q respectively in the SSM/attention duality
             x, B, C = torch.split(xBC, [self.d_inner, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
+            '''
+            NOTE: multi-value attention: shared QK, dynamic dt in different heads           
+            ''' 
             y = mamba_chunk_scan_combined(
-                rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
-                dt,
-                A,
-                rearrange(B, "b l (g n) -> b l g n", g=self.ngroups),
-                rearrange(C, "b l (g n) -> b l g n", g=self.ngroups),
-                chunk_size=self.chunk_size,
-                D=self.D,
+                rearrange(x, "b l (h p) -> b l h p", p=self.headdim), # V: B, L, H, head_dim, split V into H heads
+                dt, # B,L,nheads
+                A, # nheads
+                rearrange(B, "b l (g n) -> b l g n", g=self.ngroups), # K: B, L, head_dim
+                rearrange(C, "b l (g n) -> b l g n", g=self.ngroups), # Q: B, L, head_dim
+                chunk_size=self.chunk_size, # 256
+                D=self.D, # nheads 
                 z=None,
                 seq_idx=seq_idx,
                 initial_states=initial_states,
                 **dt_limit_kwargs,
             )
-            y = rearrange(y, "b l h p -> b l (h p)")
+            y = rearrange(y, "b l h p -> b l (h p)") # B, L, model_dim
 
             # Multiply "gate" branch and apply extra normalization layer
-            y = self.norm(y, z)
+            y = self.norm(y, z) # new normalization 
             out = self.out_proj(y)
         return out

@@ -22,6 +22,7 @@ def segsum_unstable(x):
 
 def segsum(x):
     """More stable segment sum calculation."""
+    # dtype = x.dtype; x = x.to(torch.float32) # mqy
     T = x.size(-1)
     x = repeat(x, "... d -> ... d e", e=T)
     mask = torch.tril(torch.ones(T, T, device=x.device, dtype=bool), diagonal=-1)
@@ -29,6 +30,7 @@ def segsum(x):
     x_segsum = torch.cumsum(x, dim=-2)
     mask = torch.tril(torch.ones(T, T, device=x.device, dtype=bool), diagonal=0)
     x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
+    # x_segsum = x_segsum.to(dtype) #mqy
     return x_segsum
 
 def ssd_minimal_discrete(X, A, B, C, block_len, initial_states=None):
@@ -51,30 +53,34 @@ def ssd_minimal_discrete(X, A, B, C, block_len, initial_states=None):
     A_cumsum = torch.cumsum(A, dim=-1)
 
     # 1. Compute the output for each intra-chunk (diagonal blocks)
-    L = torch.exp(segsum(A))
+    # A = A.to(torch.float32)
+    # print('A',  A.shape, A.max(), segsum(A).shape, segsum(A).max() )
+    L = torch.exp(segsum(A)) # b h c l l
+    # print('C, B, L, X', C.max(), B.max(), L.max(), X.max())
     Y_diag  = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", C, B, L, X)
 
     # 2. Compute the state for each intra-chunk
     # (right term of low-rank factorization of off-diagonal blocks; B terms)
     decay_states = torch.exp((A_cumsum[:, :, :, -1:] - A_cumsum))
-    states = torch.einsum("bclhn,bhcl,bclhp->bchpn", B, decay_states, X)
+    states = torch.einsum("bclhn,bhcl,bclhp->bchpn", B, decay_states, X) # apply inner-chunk decay
 
     # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
     # (middle term of factorization of off-diag blocks; A terms)
     if initial_states is None:
         initial_states = torch.zeros_like(states[:, :1])
     states = torch.cat([initial_states, states], dim=1)
-    decay_chunk = torch.exp(segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0))))
-    new_states = torch.einsum("bhzc,bchpn->bzhpn", decay_chunk, states)
-    states, final_state = new_states[:, :-1], new_states[:, -1]
+    decay_chunk = torch.exp(segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0)))) # chunk_level decay:  b h c -> b h c c 1 1 
+    new_states = torch.einsum("bhzc,bchpn->bzhpn", decay_chunk, states) # bchpn apply chunk_level decay
+    states, final_state = new_states[:, :-1], new_states[:, -1] # previous chunks, last chunk 
 
     # 4. Compute state -> output conversion per chunk
     # (left term of low-rank factorization of off-diagonal blocks; C terms)
     state_decay_out = torch.exp(A_cumsum)
-    Y_off = torch.einsum('bclhn,bchpn,bhcl->bclhp', C, states, state_decay_out)
+    Y_off = torch.einsum('bclhn,bchpn,bhcl->bclhp', C, states, state_decay_out) # query 
 
     # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
     Y = rearrange(Y_diag+Y_off, "b c l h p -> b (c l) h p")
+    # print('Y_diag+Y_off', Y_diag.max(), Y_off.max())
     return Y, final_state
 
 

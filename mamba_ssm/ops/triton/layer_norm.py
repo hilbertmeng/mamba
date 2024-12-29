@@ -251,7 +251,7 @@ def _layer_norm_fwd_1pass_kernel(
         y1 = x_hat * w1 + b1 if HAS_B1 else x_hat * w1
         tl.store(Y1 + cols, y1, mask=mask)
 
-
+@torch._dynamo.disable(recursive=True)
 def _layer_norm_fwd(
     x,
     weight,
@@ -855,7 +855,7 @@ class LayerNormFn(torch.autograd.Function):
             None,
         )
 
-
+@torch._dynamo.disable(recursive=True)
 def layer_norm_fn(
     x,
     weight,
@@ -889,7 +889,7 @@ def layer_norm_fn(
         return_dropout_mask,
     )
 
-
+@torch._dynamo.disable(recursive=False)
 def rms_norm_fn(
     x,
     weight,
@@ -941,6 +941,10 @@ class RMSNorm(torch.nn.Module):
         torch.nn.init.ones_(self.weight)
 
     def forward(self, x, residual=None, prenorm=False, residual_in_fp32=False):
+        # inputs = x
+        # var = inputs.pow(2).mean(dim=-1, keepdim=True)
+        # normed_inputs = inputs * torch.rsqrt(var + self.eps)
+        # return normed_inputs 
         return rms_norm_fn(
             x,
             self.weight,

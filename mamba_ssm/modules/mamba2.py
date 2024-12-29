@@ -1,7 +1,6 @@
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 
 import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,6 +24,8 @@ from mamba_ssm.distributed.distributed_utils import all_reduce, reduce_scatter
 
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
+
+from mamba_ssm.modules.ssd_minimal import ssd_minimal_discrete
 
 
 class Mamba2(nn.Module):
@@ -56,6 +57,9 @@ class Mamba2(nn.Module):
         sequence_parallel=True,
         device=None,
         dtype=None,
+        use_minimal=False,
+        dense_type='',
+        ddense=False,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -84,6 +88,9 @@ class Mamba2(nn.Module):
         self.chunk_size = chunk_size
         self.use_mem_eff_path = use_mem_eff_path
         self.layer_idx = layer_idx
+        self.use_minimal = use_minimal
+        self.dense_type = dense_type
+        self.ddense = ddense
 
         # Order: [z, x, B, C, dt]
         d_in_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
@@ -153,11 +160,17 @@ class Mamba2(nn.Module):
         Returns: same shape as u
         """
         seqlen_og = seqlen
-        if seqlen is None:
-            batch, seqlen, dim = u.shape
+
+        if len(self.dense_type)>=2:
+            assert len(u.shape) == 4 
+            num_ways, batch, seqlen, dim = u.shape
+            assert num_ways == len(self.dense_type)
         else:
-            batch_seqlen, dim = u.shape
-            batch = batch_seqlen // seqlen
+            if seqlen is None:
+                batch, seqlen, dim = u.shape
+            else:
+                batch_seqlen, dim = u.shape
+                batch = batch_seqlen // seqlen
 
         conv_state, ssm_state = None, None
         if inference_params is not None:
@@ -167,7 +180,21 @@ class Mamba2(nn.Module):
                 out, _, _ = self.step(u, conv_state, ssm_state)
                 return out
 
-        zxbcdt = self.in_proj(u)  # (B, L, d_in_proj) or (B * L, d_in_proj)
+        if len(self.dense_type)>=2:
+            # 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
+            if self.dense_type == 'zs': # gate, ssm
+                z, xbcdt = u[0] @ self.in_proj.weight[:self.d_inner].T, u[1] @ self.in_proj.weight[self.d_inner:].T
+                zxbcdt = torch.cat([z,xbcdt], dim=-1)
+            elif self.dense_type == 'zxbct': # gate, V, K, Q, A 
+                z = u[0] @ self.in_proj.weight[:self.d_inner].T
+                x = u[1] @ self.in_proj.weight[self.d_inner:2 * self.d_inner].T
+                b = u[2] @ self.in_proj.weight[2 * self.d_inner: 2 * self.d_inner + 1 * self.ngroups * self.d_state].T
+                c = u[3] @ self.in_proj.weight[2 * self.d_inner + 1 * self.ngroups * self.d_state: 2 * self.d_inner + 2 * self.ngroups * self.d_state ].T
+                dt = u[4] @ self.in_proj.weight[2 * self.d_inner + 2 * self.ngroups * self.d_state:].T
+                zxbcdt = torch.cat([z,x,b,c,dt], dim=-1)
+        else:
+            zxbcdt = self.in_proj(u)  # (B, L, d_in_proj) or (B * L, d_in_proj)
+
         if seqlen_og is not None:
             zxbcdt = rearrange(zxbcdt, "(b l) d -> b l d", l=seqlen)
         A = -torch.exp(self.A_log)  # (nheads) or (d_inner, d_state)
@@ -222,21 +249,33 @@ class Mamba2(nn.Module):
                     activation=self.activation,
                 ).transpose(1, 2)
             x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
-            y = mamba_chunk_scan_combined(
-                rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
-                dt,
-                A,
-                rearrange(B, "b l (g n) -> b l g n", g=self.ngroups),
-                rearrange(C, "b l (g n) -> b l g n", g=self.ngroups),
-                chunk_size=self.chunk_size,
-                D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
-                z=rearrange(z, "b l (h p) -> b l h p", p=self.headdim) if not self.rmsnorm else None,
-                dt_bias=self.dt_bias,
-                dt_softplus=True,
-                seq_idx=seq_idx,
-                **dt_limit_kwargs,
-                return_final_states=ssm_state is not None,
-            )
+            if self.use_minimal:
+                dt = F.softplus(dt + self.dt_bias)  # (B, L, nheads)
+                x = rearrange(x, "b l (h p) -> b l h p", p=self.headdim)
+                X = x * dt[...,None] # blhp,blh1 -> blhp 
+                A = A * dt # h * blh; static * dynamic -> dynamic
+                B = rearrange(B, "b l (g n) -> b l g n", g=self.ngroups)
+                C = rearrange(C, "b l (g n) -> b l g n", g=self.ngroups)
+                y, _ = ssd_minimal_discrete(X, A, B, C, self.chunk_size)
+                y = y + x * rearrange(self.D, "h -> h 1")
+                # print(self.layer_idx , 'x, y', x.max(), y.max())
+                y = y.to(x.dtype)
+            else:
+                y = mamba_chunk_scan_combined(
+                    rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
+                    dt,
+                    A,
+                    rearrange(B, "b l (g n) -> b l g n", g=self.ngroups),
+                    rearrange(C, "b l (g n) -> b l g n", g=self.ngroups),
+                    chunk_size=self.chunk_size,
+                    D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
+                    z=rearrange(z, "b l (h p) -> b l h p", p=self.headdim) if not self.rmsnorm else None,
+                    dt_bias=self.dt_bias,
+                    dt_softplus=True,
+                    seq_idx=seq_idx,
+                    **dt_limit_kwargs,
+                    return_final_states=ssm_state is not None,
+                )
             if ssm_state is not None:
                 y, last_state = y
                 ssm_state.copy_(last_state)

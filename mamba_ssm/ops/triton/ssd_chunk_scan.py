@@ -1240,14 +1240,14 @@ def _chunk_scan_fwd(cb, x, dt, dA_cumsum, C, states, D=None, z=None, seq_idx=Non
     if seq_idx is not None:
         assert seq_idx.shape == (batch, seqlen)
     # Allocates output.
-    out = torch.empty(batch, seqlen, nheads, headdim, device=x.device, dtype=x.dtype)
+    out = torch.empty(batch, seqlen, nheads, headdim, device=x.device, dtype=x.dtype) # blhn
     if z is not None:
         out_x = torch.empty(batch, seqlen, nheads, headdim, device=x.device, dtype=x.dtype)
         assert out_x.stride() == out.stride()
     else:
         out_x = None
     grid = lambda META: (triton.cdiv(chunk_size, META['BLOCK_SIZE_M']) * triton.cdiv(headdim, META['BLOCK_SIZE_N']),
-                    batch * nchunks, nheads)
+                    batch * nchunks, nheads) # (ln, bc, h)
     z_strides = ((z.stride(0), z.stride(1), z.stride(2), z.stride(3))
                   if z is not None else (0, 0, 0, 0))
     _chunk_scan_fwd_kernel[grid](

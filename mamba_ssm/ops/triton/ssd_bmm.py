@@ -192,7 +192,7 @@ def _bmm_chunk_fwd(a, b, chunk_size, seq_idx=None, causal=False, output_dtype=No
     dot_dtype = (tl.bfloat16 if a.dtype == torch.bfloat16 or b.dtype == torch.bfloat16 else
                  (tl.float16 if a.dtype == torch.float16 or b.dtype == torch.float16 else tl.float32))
     grid = lambda META: (triton.cdiv(chunk_size, META['BLOCK_SIZE_M']) * triton.cdiv(chunk_size, META['BLOCK_SIZE_N']),
-                    batch, nchunks if not has_groups else nchunks * ngroups)
+                    batch, nchunks if not has_groups else nchunks * ngroups) # (ll, b, c)
     with torch.cuda.device(a.device.index):
         _bmm_chunk_fwd_kernel[grid](
             a, b, out, seq_idx,

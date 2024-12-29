@@ -193,7 +193,7 @@ def _state_passing_bwd_kernel(
 
 def _state_passing_fwd(states, dA_chunk_cumsum, initial_states=None, seq_idx=None, chunk_size=None,
                        out_dtype=None):
-    batch, nchunks, nheads, dim = states.shape
+    batch, nchunks, nheads, dim = states.shape # bch(pn)
     assert dA_chunk_cumsum.shape == (batch, nheads, nchunks)
     if initial_states is not None:
         assert initial_states.shape == (batch, nheads, dim)
@@ -202,8 +202,8 @@ def _state_passing_fwd(states, dA_chunk_cumsum, initial_states=None, seq_idx=Non
         seqlen = seq_idx.shape[-1]
         assert seq_idx.shape == (batch, seqlen)
     out_dtype = states.dtype if out_dtype is None else out_dtype
-    out = torch.empty((batch, nchunks, nheads, dim), device=states.device, dtype=out_dtype)
-    final_states = torch.empty((batch, nheads, dim), device=states.device, dtype=torch.float32)
+    out = torch.empty((batch, nchunks, nheads, dim), device=states.device, dtype=out_dtype) # bch(pn)
+    final_states = torch.empty((batch, nheads, dim), device=states.device, dtype=torch.float32) # bh(pn)
     grid = lambda META: (triton.cdiv(dim, META['BLOCK_SIZE']), batch, nheads)
     with torch.cuda.device(states.device.index):
         _state_passing_fwd_kernel[grid](
