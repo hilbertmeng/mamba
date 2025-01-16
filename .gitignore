@@ -5,3 +5,4 @@ build/
 logs/*
 output_models/*
 wandb/*
+torch_compile_debug/*

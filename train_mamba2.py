@@ -1,18 +1,30 @@
 # Code modified from: https://github.com/havenhq/mamba-chat/blob/main/train_mamba.py
+import torch
+# torch._dynamo.config.inline_inbuilt_nn_modules=True
+import torch.distributed as dist
+
+import torch._dynamo.config
+import torch._inductor.config
+
+torch._dynamo.config.cache_size_limit = 64
+torch._inductor.config.coordinate_descent_tuning = True
+torch._inductor.config.triton.unique_kernel_names = True
+# Experimental features to reduce compilation times, will be on by default in future
+torch._inductor.config.fx_graph_cache = True 
+# torch._functorch.config.enable_autograd_cache = True
+
 import numpy as np
 import argparse
 import json
 import os
 import time
 import math
-import torch
-# torch._dynamo.config.inline_inbuilt_nn_modules=True
-import torch.distributed as dist
+
 
 import warnings
 import tensorflow as tf
 tf.config.set_visible_devices([], 'GPU')
-from typing import Tuple
+from typing import Tuple, Optional
 from functools import partial
 from dataclasses import dataclass, field
 from tqdm import tqdm
@@ -113,13 +125,16 @@ def load_pile_generator(data_path=None, num_files=2):
     return ds
 
 class PileDataset(Dataset):
-    def __init__(self, data_path, seq_len=2048, size='medium', debug=False):
+    def __init__(self, data_path, seq_len=2048, size='medium', debug=False, nfiles=None):
         print('load dataset')
-        if size == 'small':
-            nfiles = 4
-        elif size == 'medium':
-            nfiles = 7
-        self.generator = load_pile_generator(num_files=nfiles) 
+        if nfiles is None:
+            if size == 'small':
+                nfiles = 3
+            elif size == 'medium':
+                nfiles = 8
+            elif size == 'large':
+                nfiles = 8
+        self.generator = load_pile_generator(data_path=data_path,num_files=nfiles) 
         t0 = time.time()
         if debug:
            self.data = [self.generator.next() for _ in range(256*200)]
@@ -144,6 +159,9 @@ class MambaTrainingArguments(TrainingArguments):
     adam_beta1: float = field(default=0.9) 
     adam_beta2: float = field(default=0.95)
     adam_weight_decay: float = field(default=0.1)
+    scale_down_mudd_lr: Optional[float] = None  # 5x
+    cut_residual_lr_only: bool = False
+
     #ADAM_CLIP_THRESHOLD = 1.0 #TODO
     #ADAM_EPSILON_ROOT = 0.0 #TODO
     #def __init__(self, **kwargs):
@@ -168,17 +186,53 @@ class MyTrainer(Trainer):
 
         warnings.warn(f"These default Huggingface TrainingArguments (warmup_ratio=0, optim=OptimizerNames.ADAMW_TORCH, optim_args=None, lr_scheduler_type=SchedulerType.LINEAR) are disabled due to overriding optimzer and lr_scheduler in {__file__}")
 
-        no_decay = ["bias", "LayerNorm.weight", 'norm.weight', 'norm_f.weight'] # _no_weight_decay
-        optimizer_grouped_parameters = [
-            {
-                "params": [p for n, p in self.model.named_parameters() if not (any(nd in n for nd in no_decay) or getattr(p, '_no_weight_decay', False)) ],
-                "weight_decay": self.args.weight_decay,
-            },
-            {
-                "params": [p for n, p in self.model.named_parameters() if any(nd in n for nd in no_decay) or getattr(p, '_no_weight_decay', False) ],
-                "weight_decay": 0.0,
-            },
-        ]
+        no_decay = ["bias", "LayerNorm.weight", 'norm.weight', 'norm_f.weight', 'dense_bs'] # _no_weight_decay
+
+        def skip_weight_decay(n, p):
+            return any(nd in n for nd in no_decay) or getattr(p, '_no_weight_decay', False)
+        
+        if self.args.cut_residual_lr_only:
+            param_patterns = ['dynamic_dense_r', 'dense_bs_r']
+        else:
+            param_patterns = ['dynamic_dense', 'dense_bs']
+        def scale_down_lr(n, p):
+            return any(s in n for s in param_patterns)
+        
+        if self.args.scale_down_mudd_lr is None or self.args.scale_down_mudd_lr == 1:
+            optimizer_grouped_parameters = [
+                {
+                    "params": [p for n, p in self.model.named_parameters() if not (any(nd in n for nd in no_decay) or getattr(p, '_no_weight_decay', False)) ],
+                    "weight_decay": self.args.weight_decay,
+                },
+                {
+                    "params": [p for n, p in self.model.named_parameters() if any(nd in n for nd in no_decay) or getattr(p, '_no_weight_decay', False) ],
+                    "weight_decay": 0.0,
+                },
+            ]
+        else:
+            scaled_lr = self.args.learning_rate / self.args.scale_down_mudd_lr
+            optimizer_grouped_parameters = [
+                {
+                    "params": [p for n, p in self.model.named_parameters() if (not skip_weight_decay(n,p)) and (not scale_down_lr(n, p)) ],
+                    "weight_decay": self.args.weight_decay,
+                    "lr": self.args.learning_rate,
+                },
+                {
+                    "params": [p for n, p in self.model.named_parameters() if skip_weight_decay(n,p) and (not scale_down_lr(n, p)) ],
+                    "weight_decay": 0.0,
+                    "lr": self.args.learning_rate,
+                },
+                {
+                    "params": [p for n, p in self.model.named_parameters() if (not skip_weight_decay(n,p)) and scale_down_lr(n, p) ],
+                    "weight_decay": self.args.weight_decay,
+                    "lr": scaled_lr,
+                },
+                {
+                    "params": [p for n, p in self.model.named_parameters() if skip_weight_decay(n,p) and scale_down_lr(n, p) ],
+                    "weight_decay": 0.0,
+                    "lr": scaled_lr,
+                },
+            ]
         self.optimizer = AdamW(optimizer_grouped_parameters, lr=self.args.learning_rate, eps=self.args.adam_epsilon, betas=(self.args.adam_beta1, self.args.adam_beta2), weight_decay=self.args.adam_weight_decay)
 
         if self.lr_scheduler is None:
@@ -236,8 +290,11 @@ def compile_model(
 
 
 def run(args):
-    assert args.model_size in ['small', 'medium']
+    assert args.model_size in ['small', 'medium', 'large']
     assert args.model_name in ['Mamba1', 'Mamba2', 'Llama']
+    if bool(args.reproduce) and bool(args.ddense) and not bool(args.ddense_hid_norm):
+       assert args.scale_down_mudd_lr != 1
+    
     model_size = args.model_size
     model_name = args.model_name
     reproduce = bool(args.reproduce)
@@ -247,7 +304,10 @@ def run(args):
         hparams = dict(warmup_steps=48,num_training_steps=4800,max_steps=4800,decay_end=4800)
     elif model_size == 'medium':
         lr = 3e-4
-        hparams = dict(warmup_steps=135,num_training_steps=13500,max_steps=13500,decay_end=13500)
+        if bool(args.medium2large):
+            hparams = dict(warmup_steps=290,num_training_steps=29000,max_steps=29000,decay_end=29000)
+        else:
+            hparams = dict(warmup_steps=135,num_training_steps=13500,max_steps=13500,decay_end=13500)
     elif model_size == 'large':
         lr = 2.5e-4
         hparams = dict(warmup_steps=290,num_training_steps=29000,max_steps=29000,decay_end=29000)
@@ -295,15 +355,25 @@ def run(args):
                 "n_layer": 48,
             })
         use_minimal = False 
+        # use_minimal = True
         if use_minimal:
            model_config["ssm_cfg"]["use_mem_eff_path"] = False
            model_config["ssm_cfg"]["use_minimal"] = True 
 
         model_config["ssm_cfg"]["layer"] = model_name
+        model_config["ssm_cfg"]["expand"] = args.expand
+        # shrink d_model to make total params same
+        # model_config['d_model'] = int(model_config['d_model'] / (args.expand / 2))
+
         model_config['ddense'] = bool(args.ddense)
         model_config['dense_type'] = args.dense_type
+        model_config['cut_residual_lr_only'] = bool(args.cut_residual_lr_only)
         model_config['fused_add_norm'] = bool(args.fused_add_norm)
         model_config['tie_embeddings'] = bool(args.tie_emb) 
+        model_config['ddense_pre_norm'] = bool(args.ddense_hid_norm)
+        model_config['ddense_post_norm'] = bool(args.ddense_post_norm)
+        model_config['ddense_tanh'] = bool(args.ddense_tanh)
+        model_config['d_model_deviation'] = args.d_model_deviation
 
         model_config = MambaCustomConfig(**model_config)
         model = MambaLMHeadModel(model_config, dtype=torch.float32, device="cuda")
@@ -340,19 +410,29 @@ def run(args):
 
     num_devices = torch.cuda.device_count()
     gradient_accumulation_steps = args.gradient_accumulation_steps // num_devices
+    print('gradient_accumulation_steps:', gradient_accumulation_steps)
+    # gradient_accumulation_steps = 1
 
     for n, p in model.named_parameters():
         print(n, p.shape, p.std().item(), p.mean().item(), getattr(p, '_no_weight_decay', False))
 
+    batch_size = args.batch_size
+    if bool(args.dense_type) and model_size == 'medium' and args.dense_type in ['zs', 'zxbct', 'rzxbct']:
+        gradient_accumulation_steps *= 2
+        batch_size = batch_size // 2
+    if bool(args.dense_type) and model_size == 'small': # and args.dense_type == 'zs':
+        gradient_accumulation_steps *= 2
+        batch_size = batch_size // 2
+
     training_args = MambaTrainingArguments(
             learning_rate=lr,
             num_train_epochs=1,
-            per_device_train_batch_size=args.batch_size,
+            per_device_train_batch_size=batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
             output_dir=args.output+args.run_name,
             save_total_limit=2,
             logging_steps=1,
-            save_steps=100,
+            save_steps=500,
             run_name=args.run_name,
             resume_from_checkpoint=resume_from_checkpoint,
             min_ratio=min_ratio,
@@ -367,6 +447,8 @@ def run(args):
             torch_compile=True,
             save_safetensors=False,
             gradient_checkpointing=gradient_checkpointing,
+            scale_down_mudd_lr=args.scale_down_mudd_lr,
+            cut_residual_lr_only=args.cut_residual_lr_only,
             **hparams,
         )
 
@@ -376,6 +458,7 @@ def run(args):
 
     dataset = PileDataset(args.data_path, size=model_size, debug=args.debug)
 
+    print('data len:', len(dataset)/ 256)
     print(f'model params: {sum(p.numel() for p in model.parameters())/1024/1024} M')
     print('#'*50)
     print('run args:', args)
@@ -408,7 +491,7 @@ if __name__ == "__main__":
     parser.add_argument("--debug", type=int, default=0)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=16)
     parser.add_argument("--optim", type=str, default="adamw_torch")
-    parser.add_argument("--data_path", type=str, default="/home/mengqy/Projects/lm-dataset/val_with_eos.npy")
+    parser.add_argument("--data_path", type=str, default="/home/mengqy/Projects/lm-dataset/pile_train_dataset/")
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--ddense", type=int, default=0)
     parser.add_argument("--dense_type", type=str, default='l')
@@ -416,6 +499,13 @@ if __name__ == "__main__":
     parser.add_argument("--reproduce", type=int, default='1')
     parser.add_argument("--tie_emb", type=int, default='1')
     parser.add_argument("--resume", type=int, default='0')
+    parser.add_argument("--medium2large", type=int, default='0')
+    parser.add_argument("--ddense_hid_norm", type=int, default='0')
+    parser.add_argument("--scale_down_mudd_lr", type=float, default='1')
+    parser.add_argument("--ddense_tanh", type=int, default='0')
+    parser.add_argument("--d_model_deviation", type=float, default='0')
+    parser.add_argument("--expand", type=float, default='2')
+    parser.add_argument("--cut_residual_lr_only", type=int, default='0')
     parser.add_argument('--local-rank', type=int, help='Local rank passed from torch.distributed.launch')
 
     args = parser.parse_args()

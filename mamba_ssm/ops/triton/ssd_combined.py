@@ -756,6 +756,14 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         assert A.shape == (nheads,)
         zx0, z, xBC, dt = torch.split(zxbcdt, [2 * d_nonssm, dim, dim + ngroups * dstate * 2, nheads], dim=-1)
         seq_idx = seq_idx.contiguous() if seq_idx is not None else None
+        # print('xBC', rearrange(xBC, "b s d -> b d s").shape, rearrange(xBC, "b s d -> b d s").stride())
+        # xBC = xBC.contiguous()
+        # xBC_conv = xBC
+        # xBC_conv = rearrange(
+        #     causal_conv1d_fwd_wrapper(rearrange(xBC, "b s d -> b d s").contiguous(),
+        #                                          conv1d_weight, conv1d_bias, seq_idx, None, None, activation in ["silu", "swish"]),
+        #     "b d s -> b s d"
+        # )
         xBC_conv = rearrange(
             causal_conv1d_fwd_wrapper(rearrange(xBC, "b s d -> b d s"),
                                                  conv1d_weight, conv1d_bias, seq_idx, None, None, activation in ["silu", "swish"]),
@@ -835,6 +843,11 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
                                                  conv1d_weight, conv1d_bias, seq_idx, None, None, ctx.activation in ["silu", "swish"]),
             "b d s -> b s d"
         )
+        # xBC_conv = rearrange(
+        #     causal_conv1d_fwd_wrapper(rearrange(xBC, "b s d -> b d s").contiguous(),
+        #                                          conv1d_weight, conv1d_bias, seq_idx, None, None, ctx.activation in ["silu", "swish"]),
+        #     "b d s -> b s d"
+        # )
         x, B, C = torch.split(xBC_conv, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
         x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
         B = rearrange(B, "b l (g n) -> b l g n", g=ctx.ngroups)
@@ -881,6 +894,12 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         else:
             doutproj_weight, doutproj_bias = None, None
         dxBC_given = rearrange(dxBC_given, "b s d -> b d s")
+        # print('xBC', rearrange(xBC, "b s d -> b d s").contiguous().stride())
+        # print('dxBC', rearrange(dxBC, "b s d -> b d s").contiguous().shape, rearrange(dxBC, "b s d -> b d s").contiguous().stride(), dxBC_given.contiguous().stride())
+        # dxBC_given, dweight, dbias, *_ = causal_conv1d_cuda.causal_conv1d_bwd(
+        #     rearrange(xBC, "b s d -> b d s").contiguous(), conv1d_weight, conv1d_bias,
+        #     rearrange(dxBC, "b s d -> b d s").contiguous(), seq_idx, None, None, dxBC_given.contiguous(), False, ctx.activation in ["silu", "swish"]
+        # )
         dxBC_given, dweight, dbias, *_ = causal_conv1d_cuda.causal_conv1d_bwd(
             rearrange(xBC, "b s d -> b d s"), conv1d_weight, conv1d_bias,
             rearrange(dxBC, "b s d -> b d s"), seq_idx, None, None, dxBC_given, False, ctx.activation in ["silu", "swish"]

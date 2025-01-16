@@ -72,10 +72,13 @@ class Mamba2(nn.Module):
         self.sequence_parallel = sequence_parallel
         self.world_size = 1 if process_group is None else process_group.size()
         self.local_rank = 0 if process_group is None else process_group.rank()
-        self.d_inner = (self.expand * self.d_model) // self.world_size
+        self.d_inner = int(round(self.expand * self.d_model)) // self.world_size
         assert self.d_inner * self.world_size == self.expand * self.d_model
         self.headdim = headdim
         self.d_ssm = self.d_inner if d_ssm is None else d_ssm // self.world_size
+        # nheads = 16 # TODO
+        # assert self.d_ssm % nheads == 0
+        # self.headdim = self.d_ssm // nheads
         assert ngroups % self.world_size == 0
         self.ngroups = ngroups // self.world_size
         assert self.d_ssm % self.headdim == 0
@@ -92,6 +95,7 @@ class Mamba2(nn.Module):
         self.dense_type = dense_type
         self.ddense = ddense
 
+        print('layer_idx', layer_idx, self.d_inner, self.d_state,  self.nheads, d_model, expand)
         # Order: [z, x, B, C, dt]
         d_in_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
         if self.process_group is None:
@@ -161,10 +165,11 @@ class Mamba2(nn.Module):
         """
         seqlen_og = seqlen
 
-        if len(self.dense_type)>=2:
-            assert len(u.shape) == 4 
-            num_ways, batch, seqlen, dim = u.shape
-            assert num_ways == len(self.dense_type)
+        if self.ddense and len(self.dense_type)>=2:
+            # assert len(u.shape) == 4 
+            num_ways = len(u)
+            batch, seqlen, dim = u[0].shape
+            assert num_ways == len(self.dense_type.replace('r', ''))
         else:
             if seqlen is None:
                 batch, seqlen, dim = u.shape
@@ -180,12 +185,26 @@ class Mamba2(nn.Module):
                 out, _, _ = self.step(u, conv_state, ssm_state)
                 return out
 
-        if len(self.dense_type)>=2:
+        if self.ddense and len(self.dense_type)>=2:
             # 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
             if self.dense_type == 'zs': # gate, ssm
                 z, xbcdt = u[0] @ self.in_proj.weight[:self.d_inner].T, u[1] @ self.in_proj.weight[self.d_inner:].T
                 zxbcdt = torch.cat([z,xbcdt], dim=-1)
-            elif self.dense_type == 'zxbct': # gate, V, K, Q, A 
+            elif self.dense_type == 'rzxxbct': #  
+                z = u[0] @ self.in_proj.weight[:self.d_inner].T
+                x1 = u[1] @ self.in_proj.weight[self.d_inner: int(1.5 * self.d_inner)].T
+                x2 = u[2] @ self.in_proj.weight[int(1.5 * self.d_inner):2 * self.d_inner].T
+                # bcdt = u[3] @ self.in_proj.weight[2 * self.d_inner:].T
+                b = u[3] @ self.in_proj.weight[2 * self.d_inner: 2 * self.d_inner + 1 * self.ngroups * self.d_state].T
+                c = u[4] @ self.in_proj.weight[2 * self.d_inner + 1 * self.ngroups * self.d_state: 2 * self.d_inner + 2 * self.ngroups * self.d_state ].T
+                dt = u[5] @ self.in_proj.weight[2 * self.d_inner + 2 * self.ngroups * self.d_state:].T
+                zxbcdt = torch.cat([z,x1,x2, b,c,dt], dim=-1)
+            elif self.dense_type == 'rzxs': # 
+                z = u[0] @ self.in_proj.weight[:self.d_inner].T
+                x = u[1] @ self.in_proj.weight[self.d_inner:2 * self.d_inner].T
+                bcdt = u[2] @ self.in_proj.weight[2 * self.d_inner:].T
+                zxbcdt = torch.cat([z,x,bcdt], dim=-1)
+            elif self.dense_type in ['zxbct', 'rzxbct']: # gate, V, K, Q, A 
                 z = u[0] @ self.in_proj.weight[:self.d_inner].T
                 x = u[1] @ self.in_proj.weight[self.d_inner:2 * self.d_inner].T
                 b = u[2] @ self.in_proj.weight[2 * self.d_inner: 2 * self.d_inner + 1 * self.ngroups * self.d_state].T
@@ -199,6 +218,7 @@ class Mamba2(nn.Module):
             zxbcdt = rearrange(zxbcdt, "(b l) d -> b l d", l=seqlen)
         A = -torch.exp(self.A_log)  # (nheads) or (d_inner, d_state)
         dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
+        # print('zxbcdt', zxbcdt.shape, zxbcdt.stride(), 2 * self.d_inner, 2 * self.ngroups * self.d_state,  self.nheads)
         if self.use_mem_eff_path and inference_params is None:
             out = mamba_split_conv1d_scan_combined(
                 zxbcdt,

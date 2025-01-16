@@ -20,3 +20,8 @@ class MambaConfig(PretrainedConfig):
     tie_embeddings: bool = True
     ddense: bool = False
     dense_type: str = ''
+    ddense_pre_norm: bool = False
+    ddense_post_norm: bool = False
+    ddense_tanh: bool = False
+    d_model_deviation: float = 0
+    cut_residual_lr_only: bool = False

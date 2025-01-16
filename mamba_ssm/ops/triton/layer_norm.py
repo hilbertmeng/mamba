@@ -889,7 +889,7 @@ def layer_norm_fn(
         return_dropout_mask,
     )
 
-@torch._dynamo.disable(recursive=False)
+@torch._dynamo.disable(recursive=True)
 def rms_norm_fn(
     x,
     weight,
